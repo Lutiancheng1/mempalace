@@ -244,7 +244,16 @@ def _build_st_ef(model_key: str, hf_repo: str, ef_name: str, device: str):
     st_device = "cuda" if device == "cuda" else "cpu"
 
     class _MempalaceST(SentenceTransformerEmbeddingFunction):
-        _ef_name = ef_name
+        # Report "default" to chromadb so its EF-name conflict check
+        # (validate_embedding_function_conflict_on_get) doesn't reject a
+        # palace whose collection metadata records the previous library
+        # default. mempalace pins one model per palace via config.json
+        # plus the model-lock sentinel; mixing models is prevented at our
+        # layer, not by chromadb's string check. The actual model used to
+        # compute vectors is still ``hf_repo`` below — only the *label*
+        # is masked.
+        _ef_name = "default"
+        _mempalace_model_key = model_key
 
         @staticmethod
         def name() -> str:

@@ -56,12 +56,67 @@ _DEFAULT_BACKEND = ChromaBackend()
 NORMALIZE_VERSION = 2
 
 
+def _model_lock_path(palace_path: str) -> str:
+    """Path to the per-palace model-lock sentinel."""
+    return os.path.join(palace_path, ".mempalace_model")
+
+
+def _enforce_model_lock(palace_path: str, create: bool) -> None:
+    """Pin one embedding model per palace.
+
+    chromadb 1.5 only persists the EF *name* in collection metadata; it cannot
+    detect a real model swap if mempalace masks names. The model lock writes the
+    active ``embedding_model`` config value into ``<palace>/.mempalace_model``
+    on first contact, then refuses to open the palace if the configured model
+    later changes — vectors live in incompatible spaces across models, so a
+    silent swap would mix incompatible vectors and corrupt search.
+
+    Operators who deliberately want to switch models must reset the palace
+    (delete the collection or directory) and re-mine. CLAUDE.md's
+    "Incremental only" principle covers ingest after initial build; switching
+    embedding models is a palace-init concern, not an incremental write.
+    """
+    if not os.path.isdir(palace_path):
+        return  # nothing to lock yet — first call with create=True will create the dir
+
+    from .config import MempalaceConfig
+
+    configured = MempalaceConfig().embedding_model or "default"
+    lock_path = _model_lock_path(palace_path)
+
+    if not os.path.exists(lock_path):
+        if create:
+            try:
+                with open(lock_path, "w", encoding="utf-8") as fh:
+                    fh.write(configured + "\n")
+            except OSError:
+                logger.warning("Could not write model lock at %s", lock_path)
+        return
+
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            persisted = fh.read().strip() or "default"
+    except OSError:
+        return
+
+    if persisted != configured:
+        raise RuntimeError(
+            f"Embedding-model mismatch for palace {palace_path!r}: "
+            f"this palace was built with {persisted!r} but the current config "
+            f"requests {configured!r}. Vectors across models are not "
+            f"comparable. To switch models, reset the palace and re-mine, "
+            f"e.g. `mempalace nuke` (or delete the collection) then re-run "
+            f"the miners. The lock file is {lock_path}."
+        )
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
     create: bool = True,
 ):
     """Get the palace collection through the backend layer."""
+    _enforce_model_lock(palace_path, create=create)
     if collection_name is None:
         from .config import get_configured_collection_name
 
