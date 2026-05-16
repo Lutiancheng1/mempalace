@@ -474,6 +474,30 @@ class MempalaceConfig:
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
 
     @property
+    def embedding_model(self):
+        """Embedding model identifier. Defaults to ``"default"`` for backward
+        compatibility with palaces created before multi-model support.
+
+        Values registered in :data:`mempalace.embedding.MODEL_REGISTRY`:
+        - ``"default"`` — chromadb's all-MiniLM-L6-v2 ONNX (384d, English)
+        - ``"bge-small-zh-v1.5"`` — BAAI BGE small Chinese (512d)
+        - ``"bge-base-zh-v1.5"`` — BAAI BGE base Chinese (768d)
+        - ``"multilingual-e5-small"`` — intfloat E5 small multilingual (384d)
+        - ``"multilingual-e5-base"`` — intfloat E5 base multilingual (768d)
+        - ``"text2vec-base-chinese"`` — shibing624 Chinese text2vec (768d)
+
+        Switching models on an existing palace requires re-mining all drawers,
+        because vectors from different models live in incompatible spaces.
+
+        Read from env ``MEMPALACE_EMBEDDING_MODEL`` first, then
+        ``embedding_model`` in ``config.json``, then ``"default"``.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+        if env_val:
+            return env_val.strip()
+        return str(self._file_config.get("embedding_model", "default")).strip()
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.

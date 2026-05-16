@@ -729,6 +729,35 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_models(args):
+    """List registered embedding models and highlight the active one."""
+    from .embedding import MODEL_REGISTRY, list_models
+
+    cfg = MempalaceConfig()
+    active = cfg.embedding_model
+    print()
+    print("=" * 70)
+    print("  MemPalace — Registered Embedding Models")
+    print("=" * 70)
+    print(f"  Active: {active}")
+    if active not in MODEL_REGISTRY:
+        print(f"          (unknown — will fall back to 'default' at runtime)")
+    print()
+    print(f"  {'KEY':<25} {'DIM':>5} {'LANG':<13} DESCRIPTION")
+    print(f"  {'-' * 25} {'-' * 5} {'-' * 13} {'-' * 30}")
+    for m in list_models():
+        marker = "*" if m["key"] == active else " "
+        print(
+            f"{marker} {m['key']:<25} {m['dimension']:>5} "
+            f"{m['language']:<13} {m['description']}"
+        )
+    print()
+    print("  Switch via: MEMPALACE_EMBEDDING_MODEL=<key> mempalace ...")
+    print('  Or set "embedding_model" in ~/.mempalace/config.json')
+    print("  ⚠️  Switching models requires re-mining all drawers.")
+    print()
+
+
 def cmd_repair_status(args):
     """Read-only HNSW capacity health check (#1222)."""
     from .repair import status as repair_status
@@ -1518,6 +1547,11 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    sub.add_parser(
+        "models",
+        help="List registered embedding models and the active one",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1555,6 +1589,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "status": cmd_status,
+        "models": cmd_models,
     }
     dispatch[args.command](args)
 
