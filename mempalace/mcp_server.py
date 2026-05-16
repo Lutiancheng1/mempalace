@@ -518,6 +518,20 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
 # ==================== READ TOOLS ====================
 
 
+def _identity_text() -> str | None:
+    """Read user-authored ~/.mempalace/identity.txt for the AI to see on wake-up."""
+    path = os.path.expanduser("~/.mempalace/identity.txt")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            text = f.read().strip()
+        return text or None
+    except Exception:
+        logger.exception("failed to read identity.txt")
+        return None
+
+
 def _tool_status_via_sqlite() -> dict:
     """Pure-sqlite status reader for the #1222 fallback path.
 
@@ -587,6 +601,9 @@ def _tool_status_via_sqlite() -> dict:
             "hnsw_count": _vector_capacity_status.get("hnsw_count"),
             "divergence": _vector_capacity_status.get("divergence"),
         }
+    identity = _identity_text()
+    if identity:
+        result["identity"] = identity
     return result
 
 
@@ -617,6 +634,10 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
+    # Surface user identity.txt so AI sees user-defined wing strategy on wake-up.
+    identity = _identity_text()
+    if identity:
+        result["identity"] = identity
     try:
         all_meta = _get_cached_metadata(col)
         for m in all_meta:
