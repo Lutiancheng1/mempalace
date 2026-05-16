@@ -162,6 +162,10 @@ def _try_normalize_json(content: str) -> Optional[str]:
     if normalized:
         return normalized
 
+    normalized = _try_hermes_jsonl(content)
+    if normalized:
+        return normalized
+
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -349,6 +353,48 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", joined))
 
     if len(messages) >= 2 and has_session_metadata:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_hermes_jsonl(content: str) -> Optional[str]:
+    """Hermes-agent JSONL sessions (~/.hermes/sessions/*.jsonl).
+
+    Schema (multi-source: cli, weixin, api_server share this format):
+        {"role": "session_meta", "tools": [...]}
+        {"role": "user", "content": "...", "timestamp": "..."}
+        {"role": "assistant", "content": "...", "timestamp": "..."}
+
+    Detection requires a ``role: "session_meta"`` sentinel — same defensive
+    pattern as Codex/Gemini parsers, prevents false-positive against
+    other ``{role, content}``-shaped exports (Claude.ai JSON arrays etc).
+    Tool messages and unknown roles are skipped.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_meta = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role", "")
+        if role == "session_meta":
+            has_session_meta = True
+            continue
+        if role not in ("user", "assistant"):
+            continue
+        text = entry.get("content")
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        messages.append((role, text))
+
+    if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)
     return None
 

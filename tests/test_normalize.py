@@ -12,6 +12,7 @@ from mempalace.normalize import (
     _try_claude_code_jsonl,
     _try_codex_jsonl,
     _try_gemini_jsonl,
+    _try_hermes_jsonl,
     _try_normalize_json,
     _try_slack_json,
     normalize,
@@ -611,6 +612,70 @@ def test_gemini_jsonl_messages_before_session_metadata_discarded():
     assert "preamble A" not in result
     assert "> real Q" in result
     assert "real A" in result
+
+
+# ── _try_hermes_jsonl ──────────────────────────────────────────────────
+#
+# Hermes-agent sessions (~/.hermes/sessions/*.jsonl) are a multi-source
+# CLI/IM agent. Schema:
+#
+#   {"role":"session_meta","tools":[...]}
+#   {"role":"user","content":"...","timestamp":"..."}
+#   {"role":"assistant","content":"...","timestamp":"..."}
+#
+# Detection requires ``role: "session_meta"`` so it does not false-positive
+# against Claude.ai JSON arrays which use the same {role, content} shape
+# but as a JSON array, not JSONL.
+
+
+def test_hermes_jsonl_valid():
+    lines = [
+        json.dumps({"role": "session_meta", "tools": [{"name": "browser_back"}]}),
+        json.dumps({"role": "user", "content": "你好", "timestamp": "2026-04-13T18:05:27"}),
+        json.dumps({"role": "assistant", "content": "Hi there", "timestamp": "2026-04-13T18:05:28"}),
+    ]
+    result = _try_hermes_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> 你好" in result
+    assert "Hi there" in result
+
+
+def test_hermes_jsonl_no_session_meta_returns_none():
+    """Without the session_meta sentinel, parser must return None to avoid
+    false-positive against Claude.ai-style {role, content} arrays."""
+    lines = [
+        json.dumps({"role": "user", "content": "Hello"}),
+        json.dumps({"role": "assistant", "content": "Hi"}),
+    ]
+    result = _try_hermes_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_hermes_jsonl_skips_unknown_roles():
+    """Roles other than user/assistant (e.g. tool, system) must be skipped."""
+    lines = [
+        json.dumps({"role": "session_meta", "tools": []}),
+        json.dumps({"role": "user", "content": "Q"}),
+        json.dumps({"role": "tool", "content": "should be ignored"}),
+        json.dumps({"role": "system", "content": "also ignored"}),
+        json.dumps({"role": "assistant", "content": "A"}),
+    ]
+    result = _try_hermes_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+    assert "should be ignored" not in result
+    assert "also ignored" not in result
+
+
+def test_hermes_jsonl_too_few_messages():
+    """Only one message after session_meta returns None (need ≥2 turns)."""
+    lines = [
+        json.dumps({"role": "session_meta", "tools": []}),
+        json.dumps({"role": "user", "content": "lonely"}),
+    ]
+    result = _try_hermes_jsonl("\n".join(lines))
+    assert result is None
 
 
 # ── _try_claude_ai_json ───────────────────────────────────────────────
