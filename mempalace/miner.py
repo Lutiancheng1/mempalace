@@ -829,6 +829,7 @@ def _build_drawer_metadata(
         "chunk_index": chunk_index,
         "added_by": agent,
         "filed_at": datetime.now().isoformat(),
+        "filed_at_ts": datetime.now().timestamp(),
         "normalize_version": NORMALIZE_VERSION,
     }
     if source_mtime is not None:
@@ -993,6 +994,7 @@ def process_file(
                 "source_file": source_file,
                 "drawer_count": drawers_added,
                 "filed_at": datetime.now().isoformat(),
+                "filed_at_ts": datetime.now().timestamp(),
                 "normalize_version": NORMALIZE_VERSION,
             }
             if entities:

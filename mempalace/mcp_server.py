@@ -72,7 +72,7 @@ from .backends.chroma import (  # noqa: E402
     hnsw_capacity_status,
 )
 from .query_sanitizer import sanitize_query  # noqa: E402
-from .searcher import search_memories  # noqa: E402
+from .searcher import search_memories, _iso_to_ts  # noqa: E402
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -759,6 +759,8 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    filed_after: str = None,
+    filed_before: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -786,6 +788,8 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        filed_after=filed_after,
+        filed_before=filed_before,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -802,6 +806,8 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            filed_after=filed_after,
+            filed_before=filed_before,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -1137,7 +1143,14 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
+def tool_list_drawers(
+    wing: str = None,
+    room: str = None,
+    limit: int = 20,
+    offset: int = 0,
+    filed_after: str = None,
+    filed_before: str = None,
+):
     """List drawers with pagination. Optional wing/room filter."""
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
@@ -1156,6 +1169,10 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
             conditions.append({"wing": wing})
         if room:
             conditions.append({"room": room})
+        if filed_after:
+            conditions.append({"filed_at_ts": {"$gte": _iso_to_ts(filed_after)}})
+        if filed_before:
+            conditions.append({"filed_at_ts": {"$lte": _iso_to_ts(filed_before)}})
         if len(conditions) == 1:
             where = conditions[0]
         elif len(conditions) > 1:
@@ -1955,6 +1972,14 @@ TOOLS = {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
                 },
+                "filed_after": {
+                    "type": "string",
+                    "description": "Only return drawers filed on or after this date. Format: YYYY-MM-DD or ISO datetime (e.g. '2026-05-25').",
+                },
+                "filed_before": {
+                    "type": "string",
+                    "description": "Only return drawers filed on or before this date. Format: YYYY-MM-DD or ISO datetime (e.g. '2026-05-29').",
+                },
             },
             "required": ["query"],
         },
@@ -2053,6 +2078,14 @@ TOOLS = {
                     "type": "integer",
                     "description": "Offset for pagination (default 0)",
                     "minimum": 0,
+                },
+                "filed_after": {
+                    "type": "string",
+                    "description": "Only return drawers filed on or after this date. Format: YYYY-MM-DD or ISO datetime (e.g. '2026-05-25').",
+                },
+                "filed_before": {
+                    "type": "string",
+                    "description": "Only return drawers filed on or before this date. Format: YYYY-MM-DD or ISO datetime (e.g. '2026-05-29').",
                 },
             },
         },
@@ -2367,6 +2400,52 @@ def _restore_stdout():
     sys.stdout = _REAL_STDOUT
 
 
+def _backfill_filed_at_ts(palace_path: str) -> None:
+    """One-time migration: add ``filed_at_ts`` (float) for drawers that only have ``filed_at`` (string).
+
+    Idempotent — skips drawers that already have ``filed_at_ts``.
+    Runs once at startup; cost is O(n) sqlite reads + writes for the missing set.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return
+    try:
+        import sqlite3
+        from datetime import datetime as _dt
+
+        conn = sqlite3.connect(db_path)
+        # Find embedding IDs that have filed_at but lack filed_at_ts
+        rows = conn.execute("""
+            SELECT fa.id, fa.string_value
+            FROM embedding_metadata fa
+            WHERE fa.key = 'filed_at'
+              AND NOT EXISTS (
+                  SELECT 1 FROM embedding_metadata ts
+                  WHERE ts.id = fa.id AND ts.key = 'filed_at_ts'
+              )
+        """).fetchall()
+        if not rows:
+            conn.close()
+            return
+        count = 0
+        for eid, iso_str in rows:
+            try:
+                ts = _dt.fromisoformat(iso_str).timestamp()
+                conn.execute(
+                    "INSERT OR IGNORE INTO embedding_metadata (id, key, float_value) VALUES (?, 'filed_at_ts', ?)",
+                    (eid, ts),
+                )
+                count += 1
+            except (ValueError, TypeError):
+                continue
+        conn.commit()
+        conn.close()
+        if count:
+            logger.info("Backfilled filed_at_ts for %d drawers", count)
+    except Exception as e:
+        logger.warning("filed_at_ts backfill skipped: %s", e)
+
+
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
@@ -2398,6 +2477,10 @@ def main():
     # is visible at startup rather than on first use (#1222). Pure
     # filesystem read; never opens a chromadb client.
     _refresh_vector_disabled_flag()
+    # One-time backfill: add filed_at_ts (float) for legacy drawers
+    # that only have filed_at (string).  Idempotent.
+    if _config.palace_path:
+        _backfill_filed_at_ts(_config.palace_path)
     while True:
         try:
             line = sys.stdin.readline()

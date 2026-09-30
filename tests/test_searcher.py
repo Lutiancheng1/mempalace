@@ -84,6 +84,54 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_falls_back_on_transient_index_error(self):
+        """Date-filtered Chroma queries can raise 'Error finding id'.
+
+        The API should fall back to sqlite BM25 instead of surfacing a hard
+        error, so MCP callers doing chronological search still get results.
+        """
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+        fallback_result = {
+            "query": "test",
+            "filters": {"wing": None, "room": None},
+            "total_before_filter": 1,
+            "results": [{"text": "ok", "wing": "w", "room": "r"}],
+            "fallback": "bm25_only_via_sqlite",
+            "fallback_reason": "vector_search_disabled",
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch(
+                "mempalace.searcher._bm25_only_via_sqlite",
+                return_value=fallback_result,
+            ) as bm25_fallback,
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                filed_after="2026-06-03",
+                filed_before="2026-06-17",
+            )
+
+        assert result["results"][0]["text"] == "ok"
+        assert result["fallback"] == "bm25_only_via_sqlite"
+        assert result["fallback_reason"] == "transient_index_error"
+        assert "Error finding id" in result["vector_error"]
+        bm25_fallback.assert_called_once_with(
+            "test",
+            "/fake/path",
+            wing=None,
+            room=None,
+            n_results=5,
+            collection_name=None,
+            filed_after="2026-06-03",
+            filed_before="2026-06-17",
+        )
+
     def test_search_memories_vector_path_uses_explicit_collection_name(self):
         mock_col = MagicMock()
         mock_col.query.return_value = {

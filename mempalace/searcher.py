@@ -32,6 +32,19 @@ class SearchError(Exception):
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
 
+def _is_transient_index_error(exc: Exception) -> bool:
+    """True when Chroma surfaced the known post-write ID lookup failure.
+
+    Chroma can raise messages like ``Internal error: Error finding id`` when
+    the vector segment metadata has not fully settled yet, especially when a
+    ``where`` filter is present. In that case we can still serve a useful
+    answer by falling back to the sqlite BM25 path instead of hard-failing the
+    whole search.
+    """
+    message = str(exc)
+    return "Error finding id" in message or "Internal error" in message
+
+
 def _first_or_empty(results, key: str) -> list:
     """Return the first inner list of a query result field, or [].
 
@@ -165,15 +178,45 @@ def _hybrid_rank(
     return results
 
 
-def build_where_filter(wing: str = None, room: str = None) -> dict:
-    """Build ChromaDB where filter for wing/room filtering."""
-    if wing and room:
-        return {"$and": [{"wing": wing}, {"room": room}]}
-    elif wing:
-        return {"wing": wing}
-    elif room:
-        return {"room": room}
-    return {}
+def _iso_to_ts(iso_str: str) -> float:
+    """Convert ISO date/datetime string to Unix timestamp.
+
+    Accepts ``YYYY-MM-DD`` (midnight local) or full ISO datetime.
+    """
+    from datetime import datetime as _dt
+
+    if len(iso_str) <= 10:  # date only
+        return _dt.strptime(iso_str, "%Y-%m-%d").timestamp()
+    return _dt.fromisoformat(iso_str).timestamp()
+
+
+def build_where_filter(
+    wing: str = None,
+    room: str = None,
+    filed_after: str = None,
+    filed_before: str = None,
+) -> dict:
+    """Build ChromaDB where filter for wing/room/date filtering.
+
+    ``filed_after`` / ``filed_before`` accept ISO date (YYYY-MM-DD) or
+    full ISO datetime strings.  These are converted to Unix timestamps
+    and compared against the ``filed_at_ts`` float metadata field, since
+    ChromaDB ``$gte``/``$lte`` only works with numeric values.
+    """
+    conds: list = []
+    if wing:
+        conds.append({"wing": wing})
+    if room:
+        conds.append({"room": room})
+    if filed_after:
+        conds.append({"filed_at_ts": {"$gte": _iso_to_ts(filed_after)}})
+    if filed_before:
+        conds.append({"filed_at_ts": {"$lte": _iso_to_ts(filed_before)}})
+    if not conds:
+        return {}
+    if len(conds) == 1:
+        return conds[0]
+    return {"$and": conds}
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
@@ -383,6 +426,8 @@ def _bm25_only_via_sqlite(
     max_candidates: int = 500,
     _include_internal: bool = False,
     collection_name: str = None,
+    filed_after: str = None,
+    filed_before: str = None,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -434,6 +479,23 @@ def _bm25_only_via_sqlite(
                 """
             )
             params.extend([key, value])
+        # Date range filtering on filed_at_ts (Unix timestamp float)
+        for op, iso_value in ((">=", filed_after), ("<=", filed_before)):
+            if not iso_value:
+                continue
+            ts = _iso_to_ts(iso_value)
+            clauses.append(
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mf
+                    WHERE mf.id = {row_id_expr}
+                      AND mf.key = 'filed_at_ts'
+                      AND mf.float_value {op} ?
+                )
+                """
+            )
+            params.append(ts)
         return "".join(clauses), params
 
     try:
@@ -734,6 +796,8 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    filed_after: str = None,
+    filed_before: str = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -771,6 +835,8 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
+        filed_after: Only return drawers filed on or after this ISO date/datetime.
+        filed_before: Only return drawers filed on or before this ISO date/datetime.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -785,6 +851,8 @@ def search_memories(
             room=room,
             n_results=n_results,
             collection_name=collection_name,
+            filed_after=filed_after,
+            filed_before=filed_before,
         )
 
     try:
@@ -796,7 +864,7 @@ def search_memories(
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
 
-    where = build_where_filter(wing, room)
+    where = build_where_filter(wing, room, filed_after, filed_before)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -815,6 +883,21 @@ def search_memories(
             dkwargs["where"] = where
         drawer_results = drawers_col.query(**dkwargs)
     except Exception as e:
+        if _is_transient_index_error(e):
+            fallback = _bm25_only_via_sqlite(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                n_results=n_results,
+                collection_name=collection_name,
+                filed_after=filed_after,
+                filed_before=filed_before,
+            )
+            if "error" not in fallback:
+                fallback["fallback_reason"] = "transient_index_error"
+                fallback["vector_error"] = str(e)
+            return fallback
         return {"error": f"Search error: {e}"}
 
     # Gather closet hits (best-per-source) to build a boost lookup.
