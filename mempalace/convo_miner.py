@@ -20,6 +20,7 @@ from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    bulk_check_mined,
     file_already_mined,
     get_collection,
     mine_lock,
@@ -356,9 +357,17 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
     drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
-        # at the current schema. A stale-version hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file):
+        # at the current schema. We pass check_mtime=True so a re-mined file
+        # whose mtime now matches the just-stored value is correctly recognized
+        # as "already done by a sibling process" and skipped. This is also the
+        # case used to handle convo files that were appended to: external
+        # mtime_map check decides to rebuild, this re-check after lock handles
+        # the race where another process finished the rebuild while we waited.
+        # Note: legacy drawers without source_mtime fail check_mtime=True and
+        # would re-mine here. The outer mined_set/mtime_map guard now handles
+        # that case (preserving upstream skip-on-path-match behavior), so by
+        # the time we reach this lock, we genuinely intend to (re)mine.
+        if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. When the normalize schema bumps,
@@ -374,6 +383,10 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
         filed_at = datetime.now().isoformat()
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -385,20 +398,21 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
-                batch_metas.append(
-                    {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                    }
-                )
+                meta = {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+                if source_mtime is not None:
+                    meta["source_mtime"] = source_mtime
+                batch_metas.append(meta)
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -473,12 +487,22 @@ def mine_convos(
 
     collection = get_collection(palace_path) if not dry_run else None
 
-    # Bulk pre-fetch already-mined set in one paginated pass instead of
-    # `len(files)` separate WHERE-source_file queries. On a 150k-drawer
-    # palace each per-file query costs ~2s, so a 2000-file sweep used to
-    # spend >1h just deciding to skip. prefetch_mined_set() does the same
-    # decisions in a single scan; loop body becomes an O(1) set check.
-    mined_set: set[str] = prefetch_mined_set(collection) if not dry_run else set()
+    # Bulk pre-fetch already-mined set with mtime in one paginated pass instead
+    # of `len(files)` separate WHERE-source_file queries. Conversation files
+    # (Claude Code/Codex .jsonl) are appended to as users continue sessions, so
+    # mtime-aware skipping is required to pick up continued conversations.
+    # Fork delta vs upstream: upstream uses prefetch_mined_set() (path-only),
+    # which leaves continued sessions stuck at their first-mine snapshot.
+    # mined_set covers files filed at current NORMALIZE_VERSION (with or
+    # without stored mtime); mtime_map only has the subset that *does* have
+    # source_mtime. Falling back to mined_set keeps legacy convos (filed before
+    # this fork) from being re-mined wholesale on first run.
+    if not dry_run:
+        mtime_map: dict[str, float] = bulk_check_mined(collection)
+        mined_set: set[str] = prefetch_mined_set(collection)
+    else:
+        mtime_map = {}
+        mined_set = set()
 
     total_drawers = 0
     files_skipped = 0
@@ -487,10 +511,23 @@ def mine_convos(
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
 
-        # Skip if already filed at current NORMALIZE_VERSION
         if not dry_run and source_file in mined_set:
-            files_skipped += 1
-            continue
+            if source_file in mtime_map:
+                # Have stored mtime: re-mine only if file changed.
+                try:
+                    current_mtime = os.path.getmtime(source_file)
+                    if abs(mtime_map[source_file] - current_mtime) < 0.001:
+                        files_skipped += 1
+                        continue
+                except OSError:
+                    files_skipped += 1
+                    continue
+            else:
+                # Legacy drawer with no mtime — preserve upstream behavior
+                # (skip on path match) so the first run after this fork
+                # doesn't re-mine the whole convo corpus.
+                files_skipped += 1
+                continue
 
         # Normalize format
         try:
