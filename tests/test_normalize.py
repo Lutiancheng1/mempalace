@@ -7,10 +7,12 @@ from mempalace.normalize import (
     _format_tool_result,
     _format_tool_use,
     _messages_to_transcript,
+    _try_antigravity_jsonl,
     _try_chatgpt_json,
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_cursor_jsonl,
     _try_gemini_jsonl,
     _try_hermes_jsonl,
     _try_normalize_json,
@@ -675,6 +677,197 @@ def test_hermes_jsonl_too_few_messages():
         json.dumps({"role": "user", "content": "lonely"}),
     ]
     result = _try_hermes_jsonl("\n".join(lines))
+    assert result is None
+
+
+# ── _try_antigravity_jsonl ─────────────────────────────────────────────
+#
+# Antigravity CLI/IDE session logs (transcript.jsonl). Schema:
+#
+#   {"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>...</USER_REQUEST>"}
+#   {"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"..."}
+#
+# Detection requires the step_index+source+type signature on at least one
+# line so it does not false-positive against other JSONL formats.
+
+
+def test_antigravity_jsonl_valid():
+    lines = [
+        json.dumps(
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>帮我查一下状态</USER_REQUEST>",
+            }
+        ),
+        json.dumps(
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "好的，正在查询。",
+            }
+        ),
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> 帮我查一下状态" in result
+    assert "好的，正在查询。" in result
+    assert "<USER_REQUEST>" not in result
+
+
+def test_antigravity_jsonl_no_signature_returns_none():
+    """Without the step_index/source/type signature, parser must return None."""
+    lines = [
+        json.dumps({"role": "user", "content": "Hello"}),
+        json.dumps({"role": "assistant", "content": "Hi"}),
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_antigravity_jsonl_too_few_messages():
+    """A single user turn with the signature returns None (need ≥2 turns)."""
+    lines = [
+        json.dumps(
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "lonely",
+            }
+        ),
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is None
+
+
+# ── _try_cursor_jsonl ──────────────────────────────────────────────────
+#
+# Cursor agent-transcripts (~/.cursor/projects/*/agent-transcripts/*/*.jsonl):
+#
+#   {"role":"user","message":{"content":[{"type":"text","text":"<user_query>Q</user_query>"}]}}
+#   {"role":"assistant","message":{"content":[{"type":"text","text":"A"}]}}
+#
+# Detection: first valid JSON line must be role=user with message.content
+# as a LIST (Claude Code JSONL uses a string content field, so the two
+# don't collide).
+
+
+def test_cursor_jsonl_valid():
+    lines = [
+        json.dumps(
+            {
+                "role": "user",
+                "message": {
+                    "content": [{"type": "text", "text": "<user_query>你好</user_query>"}]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "Hi there"}]},
+            }
+        ),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> 你好" in result
+    assert "Hi there" in result
+    assert "<user_query>" not in result
+
+
+def test_cursor_jsonl_first_line_not_user_returns_none():
+    """Detection requires the first line to be role=user; else None."""
+    lines = [
+        json.dumps(
+            {
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "first"}]},
+            }
+        ),
+        json.dumps(
+            {
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "second"}]},
+            }
+        ),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_cursor_jsonl_strips_timestamp_prefix():
+    """Cursor wraps user text in <user_query> and may prefix a <timestamp>."""
+    lines = [
+        json.dumps(
+            {
+                "role": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<timestamp>2026-09-30T10:00:00</timestamp>"
+                            "<user_query>real question</user_query>",
+                        }
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "answer"}]},
+            }
+        ),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> real question" in result
+    assert "timestamp" not in result
+
+
+def test_cursor_jsonl_merges_consecutive_assistant_blocks():
+    """Multi-turn tool loops emit consecutive assistant blocks; merge them."""
+    lines = [
+        json.dumps(
+            {
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "<user_query>go</user_query>"}]},
+            }
+        ),
+        json.dumps(
+            {
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "part one"}]},
+            }
+        ),
+        json.dumps(
+            {
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "part two"}]},
+            }
+        ),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is not None
+    assert "part one" in result
+    assert "part two" in result
+
+
+def test_cursor_jsonl_too_few_messages():
+    """Only one user message returns None (need ≥2 turns)."""
+    lines = [
+        json.dumps(
+            {
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "lonely"}]},
+            }
+        ),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
     assert result is None
 
 

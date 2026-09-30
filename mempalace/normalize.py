@@ -150,6 +150,10 @@ def normalize(filepath: str) -> str:
 def _try_normalize_json(content: str) -> Optional[str]:
     """Try all known JSON chat schemas."""
 
+    normalized = _try_antigravity_jsonl(content)
+    if normalized:
+        return normalized
+
     normalized = _try_claude_code_jsonl(content)
     if normalized:
         return normalized
@@ -166,6 +170,10 @@ def _try_normalize_json(content: str) -> Optional[str]:
     if normalized:
         return normalized
 
+    normalized = _try_cursor_jsonl(content)
+    if normalized:
+        return normalized
+
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -176,6 +184,54 @@ def _try_normalize_json(content: str) -> Optional[str]:
         if normalized:
             return normalized
 
+    return None
+
+
+def _clean_antigravity_user_text(text: str) -> str:
+    text = text.strip()
+    # Strip <USER_REQUEST> ... </USER_REQUEST>
+    match = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _try_antigravity_jsonl(content: str) -> Optional[str]:
+    """Antigravity CLI/IDE session logs (transcript.jsonl).
+    Each line is a JSON object with step_index, source, type, content, etc.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    is_antigravity = False
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        # Check if this matches the Antigravity log signature
+        if "step_index" in entry and "source" in entry and "type" in entry:
+            is_antigravity = True
+        else:
+            continue
+
+        source = entry.get("source", "")
+        entry_type = entry.get("type", "")
+        text = entry.get("content", "")
+
+        if source == "USER_EXPLICIT" and entry_type == "USER_INPUT":
+            cleaned_text = _clean_antigravity_user_text(text)
+            if cleaned_text:
+                messages.append(("user", cleaned_text))
+        elif source == "MODEL" and entry_type == "PLANNER_RESPONSE" and "content" in entry:
+            if isinstance(text, str) and text.strip():
+                messages.append(("assistant", text.strip()))
+
+    if is_antigravity and len(messages) >= 2:
+        return _messages_to_transcript(messages)
     return None
 
 
@@ -395,6 +451,80 @@ def _try_hermes_jsonl(content: str) -> Optional[str]:
         messages.append((role, text))
 
     if len(messages) >= 2 and has_session_meta:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_cursor_jsonl(content: str) -> Optional[str]:
+    """Cursor agent-transcripts JSONL sessions.
+
+    Schema (~/.cursor/projects/*/agent-transcripts/*/<uuid>.jsonl):
+        {"role": "user",      "message": {"content": [{"type": "text", "text": "..."}]}}
+        {"role": "assistant", "message": {"content": [{"type": "text", "text": "..."}, {"type": "tool_use", ...}]}}
+
+    Detection: first valid JSON line has ``role`` key + ``message.content`` is
+    a list.  Cursor always wraps user text in ``<user_query>...</user_query>``
+    tags; these are stripped for cleaner transcripts.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    if not lines:
+        return None
+
+    # Quick detection: first line must be role=user with message.content list
+    try:
+        first = json.loads(lines[0])
+    except (json.JSONDecodeError, IndexError):
+        return None
+    if not isinstance(first, dict):
+        return None
+    if first.get("role") != "user":
+        return None
+    msg = first.get("message")
+    if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
+        return None
+
+    messages = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content_blocks = msg.get("content", [])
+        if not isinstance(content_blocks, list):
+            continue
+
+        text = _extract_content(content_blocks)
+        if not text:
+            continue
+
+        # Strip <user_query>...</user_query> wrapper from user messages
+        if role == "user":
+            import re
+            m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.DOTALL)
+            if m:
+                text = m.group(1).strip()
+            # Also strip <timestamp>...</timestamp> prefix
+            text = re.sub(r"<timestamp>.*?</timestamp>\s*", "", text, flags=re.DOTALL).strip()
+
+        if not text:
+            continue
+
+        # Merge consecutive assistant blocks (multi-turn tool loop)
+        if role == "assistant" and messages and messages[-1][0] == "assistant":
+            prev_role, prev_text = messages[-1]
+            messages[-1] = (prev_role, prev_text + "\n" + text)
+        else:
+            messages.append((role, text))
+
+    if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
 
