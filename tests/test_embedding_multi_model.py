@@ -8,7 +8,6 @@ loaders are smoke-tested with a mock so the suite stays fast and offline.
 
 from __future__ import annotations
 
-import os
 from unittest import mock
 
 import pytest
@@ -52,22 +51,24 @@ def test_default_model_uses_onnx_backend(monkeypatch):
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
     monkeypatch.delenv("MEMPALACE_EMBEDDING_DEVICE", raising=False)
 
-    ef = emb_mod.get_embedding_function(model="default", device="cpu")
+    ef = emb_mod._real_get_embedding_function(model="default", device="cpu")
     assert ef.name() == "default"
     # _MempalaceONNX is the ONNX subclass — verify by checking class chain.
     assert "ONNX" in type(ef).__mro__[1].__name__
 
 
 def test_unknown_model_falls_back_to_default(monkeypatch, caplog):
+    """Upstream semantics: unrecognized model names land on the built-in
+    MiniLM ONNX EF (same vectors, name masked to "default") rather than
+    raising — a typo must never hard-fail the miner."""
     emb_mod._EF_CACHE.clear()
     emb_mod._WARNED.clear()
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
 
-    with caplog.at_level("WARNING"):
-        ef = emb_mod.get_embedding_function(model="not-a-real-model", device="cpu")
+    ef = emb_mod._real_get_embedding_function(model="not-a-real-model", device="cpu")
 
     assert ef.name() == "default"
-    assert any("Unknown embedding_model" in r.message for r in caplog.records)
+    assert "ONNX" in type(ef).__mro__[1].__name__
 
 
 def test_st_loader_called_with_repo_and_name(monkeypatch):
@@ -90,7 +91,7 @@ def test_st_loader_called_with_repo_and_name(monkeypatch):
 
     monkeypatch.setattr(emb_mod, "_build_st_ef", fake_build)
 
-    ef = emb_mod.get_embedding_function(model="bge-small-zh-v1.5", device="cpu")
+    ef = emb_mod._real_get_embedding_function(model="bge-small-zh-v1.5", device="cpu")
 
     assert ef is fake_st_instance
     assert captured["args"][0] == "bge-small-zh-v1.5"
@@ -109,7 +110,7 @@ def test_st_missing_falls_back_to_default(monkeypatch, caplog):
     monkeypatch.setattr(emb_mod, "_build_st_ef", boom)
 
     with caplog.at_level("WARNING"):
-        ef = emb_mod.get_embedding_function(model="bge-small-zh-v1.5", device="cpu")
+        ef = emb_mod._real_get_embedding_function(model="bge-small-zh-v1.5", device="cpu")
 
     assert ef.name() == "default"
     msgs = " ".join(r.message for r in caplog.records)
@@ -143,9 +144,11 @@ def test_config_embedding_model_env_overrides_file(monkeypatch, tmp_path):
     assert cfg.embedding_model == "multilingual-e5-small"
 
 
-def test_config_embedding_model_defaults_to_default(monkeypatch, tmp_path):
+def test_config_embedding_model_defaults_to_minilm(monkeypatch, tmp_path):
+    """Upstream contract: unset embedding_model resolves to "minilm" (the
+    built-in ONNX default). Registry keys resolve verbatim when configured."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
 
     cfg = MempalaceConfig()
-    assert cfg.embedding_model == "default"
+    assert cfg.embedding_model == "minilm"
