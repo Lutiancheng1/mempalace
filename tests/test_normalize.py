@@ -461,6 +461,138 @@ def test_codex_jsonl_payload_not_dict():
     assert result is not None
 
 
+def test_codex_jsonl_new_format_response_items():
+    """Newer Codex builds: conversation lives only in response_item messages."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "帮我修一下登录的 bug"}],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "已修复"}],
+                },
+            }
+        ),
+        json.dumps({"type": "response_item", "payload": {"type": "reasoning"}}),
+        json.dumps({"type": "token_usage_record", "payload": {}}),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "帮我修一下登录的 bug" in result
+    assert "已修复" in result
+
+
+def test_codex_jsonl_new_format_filters_injections():
+    """Injection blocks are dropped per-part; the real user text survives."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "<user_instructions>\nAGENTS 内容"},
+                        {"type": "input_text", "text": "<environment_context>\n环境信息"},
+                        {"type": "input_text", "text": "继续 推进 收尾"},
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "好的，继续推进。",
+                },
+            }
+        ),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "继续 推进 收尾" in result
+    assert "AGENTS 内容" not in result
+    assert "环境信息" not in result
+
+
+def test_codex_jsonl_injection_only_user_message_dropped():
+    """A user message that is nothing but injections contributes nothing."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<codex_internal_context>goal"}],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "回复一"}],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "回复二"}],
+                },
+            }
+        ),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "codex_internal_context" not in result
+
+
+def test_codex_jsonl_legacy_format_preferred_over_response_items():
+    """Files with legacy event_msg turns keep the old behavior exactly."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "response 版本的问题"}],
+                },
+            }
+        ),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "response 版本的问题" not in result
+
+
 # ── _try_gemini_jsonl ──────────────────────────────────────────────────
 #
 # Gemini CLI sessions live at ``~/.gemini/tmp/<project_hash>/chats/`` as
@@ -641,7 +773,9 @@ def test_hermes_jsonl_valid():
     lines = [
         json.dumps({"role": "session_meta", "tools": [{"name": "browser_back"}]}),
         json.dumps({"role": "user", "content": "你好", "timestamp": "2026-04-13T18:05:27"}),
-        json.dumps({"role": "assistant", "content": "Hi there", "timestamp": "2026-04-13T18:05:28"}),
+        json.dumps(
+            {"role": "assistant", "content": "Hi there", "timestamp": "2026-04-13T18:05:28"}
+        ),
     ]
     result = _try_hermes_jsonl("\n".join(lines))
     assert result is not None
@@ -767,9 +901,7 @@ def test_cursor_jsonl_valid():
         json.dumps(
             {
                 "role": "user",
-                "message": {
-                    "content": [{"type": "text", "text": "<user_query>你好</user_query>"}]
-                },
+                "message": {"content": [{"type": "text", "text": "<user_query>你好</user_query>"}]},
             }
         ),
         json.dumps(
@@ -1037,8 +1169,6 @@ class TestGeminiJson:
         assert "A2" in result
         assert "> Q1" in result
         assert "> Q2" in result
-
-
 
 
 # ── _try_claude_ai_json ───────────────────────────────────────────────

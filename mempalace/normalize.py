@@ -420,15 +420,47 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+_CODEX_INJECTION_PREFIXES = (
+    "<user_instructions",
+    "<environment_context",
+    "<turn_context",
+    "<codex_internal_context",
+    "<permissions",
+    "<user_shell_command",
+    "<system",
+    "# agents.md",
+)
+
+
+def _codex_response_item_parts(payload: dict) -> list[str]:
+    """Text parts of a new-format Codex ``response_item`` message payload."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [
+            item["text"]
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+    return []
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Uses only event_msg entries (user_message / agent_message) which represent
-    the canonical conversation turns. response_item entries are skipped because
-    they include synthetic context injections and duplicate the real messages.
+    Legacy format: ``event_msg`` entries (``user_message`` / ``agent_message``)
+    carry the canonical turns, so ``response_item`` entries are skipped (they
+    duplicate the real messages and include synthetic context injections).
+
+    Newer Codex builds no longer emit those event messages; the conversation
+    only exists as ``response_item`` messages. For files without legacy event
+    messages, user/assistant turns are taken from ``response_item`` messages
+    with per-part injection filtering instead.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
+    response_messages = []
     has_session_meta = False
     for line in lines:
         try:
@@ -443,26 +475,41 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             has_session_meta = True
             continue
 
-        if entry_type != "event_msg":
-            continue
-
         payload = entry.get("payload", {})
         if not isinstance(payload, dict):
             continue
 
-        payload_type = payload.get("type", "")
-        msg = payload.get("message")
-        if not isinstance(msg, str):
-            continue
-        text = msg.strip()
-        if not text:
-            continue
+        if entry_type == "event_msg":
+            payload_type = payload.get("type", "")
+            msg = payload.get("message")
+            if not isinstance(msg, str):
+                continue
+            text = msg.strip()
+            if not text:
+                continue
 
-        if payload_type == "user_message":
-            messages.append(("user", text))
-        elif payload_type == "agent_message":
-            messages.append(("assistant", text))
+            if payload_type == "user_message":
+                messages.append(("user", text))
+            elif payload_type == "agent_message":
+                messages.append(("assistant", text))
+        elif entry_type == "response_item" and payload.get("type") == "message":
+            role = payload.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            parts = _codex_response_item_parts(payload)
+            if role == "user":
+                parts = [
+                    part
+                    for part in parts
+                    if not part.lstrip().lower().startswith(_CODEX_INJECTION_PREFIXES)
+                ]
+            text = "\n".join(part.strip() for part in parts if part.strip()).strip()
+            if not text:
+                continue
+            response_messages.append((role, text))
 
+    if not messages:
+        messages = response_messages
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)
     return None
@@ -678,6 +725,7 @@ def _try_cursor_jsonl(content: str) -> Optional[str]:
         # Strip <user_query>...</user_query> wrapper from user messages
         if role == "user":
             import re
+
             m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.DOTALL)
             if m:
                 text = m.group(1).strip()
@@ -779,7 +827,6 @@ def _try_gemini_json(data) -> Optional[str]:
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
-
 
 
 def _try_claude_ai_json(data) -> Optional[str]:
